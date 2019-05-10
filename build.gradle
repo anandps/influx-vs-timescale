@@ -1,0 +1,16 @@
+plugins {
+    id "org.kordamp.gradle.livereload" version "0.2.1"
+}
+
+apply from:"${rootDir}/gradle/asciidoctor.gradle"
+
+liveReload {
+    docRoot file("${buildDir}/asciidoc_html5").canonicalPath
+}
+
+asciidoctor {
+    sources {
+        setIncludes(['*/*.adoc', '*/*/*.adoc'])
+        exclude '**/_*'
+    }
+}

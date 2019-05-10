@@ -1,0 +1,452 @@
+buildscript {
+    repositories {
+        jcenter()
+    }
+    dependencies {
+        classpath 'org.asciidoctor:asciidoctor-gradle-plugin:1.5.7'
+        classpath 'de.undercouch:gradle-download-task:3.4.3'
+    }
+}
+
+apply plugin: org.asciidoctor.gradle.AsciidoctorPlugin
+
+dependencies {
+    asciidoctor 'org.asciidoctor:asciidoctorj-pdf:1.5.0-alpha.16'
+    asciidoctor 'org.asciidoctor:asciidoctorj-diagram:1.5.8'
+    asciidoctor 'org.jruby:jruby-complete:9.1.17.0'
+}
+
+asciidoctorj {
+    version = '1.5.7'
+}
+
+asciidoctor {
+    backends = ['html5']
+    requires = ['asciidoctor-diagram']
+    attributes = [
+            doctype             : 'book',
+            'source-highlighter': 'highlightjs',
+            icons               : 'font',
+            toc                 : 'left',
+            toclevels           : '3',
+            numbered            : '',
+            sectlinks           : '',
+            sectanchors         : '',
+            hardbreaks          : '',
+            imagesdir           : 'images'
+    ]
+}
+
+// workaround for https://github.com/asciidoctor/asciidoctor-gradle-plugin/issues/222
+import org.asciidoctor.gradle.AsciidoctorProxyImpl
+
+def shortestRelativePath(Collection<File> parents, File file) {
+    def shortest = null
+    parents.each { parent ->
+        def relpath = parent.toPath().relativize(file.toPath()).toString()
+        if (shortest == null || relpath.length() < shortest.length()) {
+            shortest = relpath
+        }
+    }
+    shortest
+}
+
+AsciidoctorProxyImpl.metaClass.invokeMethod = { String name, arguments ->
+    if (name == "unregisterAllExtensions") {
+        // ignore unregisterAllExtensions call
+        return
+    }
+    return AsciidoctorProxyImpl.metaClass.getMetaMethod(name, arguments).doMethodInvoke(delegate, arguments)
+}
+
+// render PDFs separately because of bug with generated images
+project.afterEvaluate {
+    asciidoctor { task ->
+        logDocuments = true
+        // processed documents can be limited by specifying -PasciidoctorSourcePattern=[input document]
+        if (project.hasProperty('asciidoctorSourcePattern')) {
+            // asciidoctor task doesn't have a public method to reset the patterns
+            // reset existing pattern by using Groovy meta class.
+            task.getClass().superclass
+                    .metaClass.getMetaProperty('sourceDocumentPattern')
+                    .setProperty(task, new PatternSet())
+            sources {
+                include project.property('asciidoctorSourcePattern')
+                exclude '**/_*'
+            }
+        }
+        resources {
+            from(sourceDir) {
+                // support images in subdirectories
+                include '**/images/**'
+                exclude '**/*.adoc', '**/*.plantuml'
+            }
+        }
+    }
+
+    ['pdf', 'docbook', 'docbook45'].each { backend ->
+        task('asciidoctor' + backend.capitalize(), type: org.asciidoctor.gradle.AsciidoctorTask, group: 'Documentation', description: "Renders $backend from Asciidoc sources") { task ->
+            logDocuments = true
+            def asciidoctorTask = project.tasks.getByName('asciidoctor')
+            if (backend == 'pdf') {
+                build.dependsOn task
+            }
+            backends = [backend]
+            def sourceDocumentPatternProperty = org.asciidoctor.gradle.AsciidoctorTask.metaClass.getMetaProperty('sourceDocumentPattern')
+            sourceDocumentPatternProperty.setProperty(task, sourceDocumentPatternProperty.getProperty(asciidoctorTask))
+            requires = asciidoctorTask.requires
+            def outDir = new File(project.buildDir, 'asciidoc/' + backend)
+            outputDir outDir
+            separateOutputDirs = false
+            def imagesOutdir = new File(outDir, 'images')
+            attributes asciidoctorTask.attributes + [
+                    'imagesoutdir': imagesOutdir,
+                    'imagesdir'   : backend == 'pdf' ? imagesOutdir : 'images',
+            ]
+            resources {
+                // don't copy anything by default
+            }
+            doFirst {
+                copy {
+                    from(sourceDir) {
+                        include '**/images/*'
+                        exclude '**/*.adoc', '**/*.plantuml'
+                    }
+                    into imagesOutdir
+                    // flatten directory structure
+                    eachFile {
+                        path = name
+                    }
+                    includeEmptyDirs = false
+                }
+            }
+        }
+    }
+
+
+
+    task('asciidoctorDocx', group: 'Documentation', description: "Renders docx with pandoc from docbook files") { task ->
+        def docbookTask = project.tasks.getByName('asciidoctorDocbook')
+        dependsOn docbookTask
+        docbookTask.outputDirectories.each { inputs.dir it } 
+        def docxDir = new File(project.buildDir, 'asciidoc/docx')
+        outputs.dir docxDir
+        doLast {
+            inputs.files.each { file ->
+                if (file.name.endsWith('.xml')) {
+                    def relpath = shortestRelativePath(docbookTask.outputDirectories, file)
+                    def outputFile = new File(docxDir, (relpath - ~/\.xml$/) + ".docx")
+                    outputFile.parentFile.mkdirs()
+                    exec {
+                        workingDir new File(project.buildDir, 'asciidoc/docbook')
+                        executable = "pandoc"
+                        args = ['-r', 'docbook',
+                                '-t', 'docx',
+                                '-o', outputFile.absolutePath,
+                                file.absolutePath]
+                    }
+                }
+            }
+        }
+    }
+
+    ext {
+        doconvVirtualEnv = new File(System.getProperty("user.home"), ".virtualenvs/doconv")
+    }
+
+    task('installDoconv') {
+        doFirst {
+            if (!doconvVirtualEnv.exists()) {
+                exec {
+                    commandLine = ['bash', '-c', '. /usr/share/virtualenvwrapper/virtualenvwrapper.sh; mkvirtualenv doconv']
+                }
+                exec {
+                    commandLine = ['bash', '-c', ". ${doconvVirtualEnv}/bin/activate; pip install doconv networkx==1.11"]
+                }
+            }
+        }
+    }
+
+    task('asciidoctorDita', group: 'Documentation', description: "Renders DITA with doconv from docbook files") { task ->
+        dependsOn installDoconv
+        def docbookTask = project.tasks.getByName('asciidoctorDocbook45')
+        dependsOn docbookTask
+        docbookTask.outputDirectories.each { inputs.dir it }
+        def outputDir = new File(project.buildDir, 'asciidoc/dita')
+        outputs.dir outputDir
+        doLast {
+            inputs.files.each { file ->
+                if (file.name.endsWith('.xml')) {
+                    def relpath = shortestRelativePath(docbookTask.outputDirectories, file)
+                    def outputFile = new File(outputDir, (relpath - ~/\.xml$/) + ".dita.xml")
+                    outputFile.parentFile.mkdirs()
+                    exec {
+                        workingDir new File(project.buildDir, 'asciidoc/docbook45')
+                        executable = "${doconvVirtualEnv}/bin/doconv"
+                        args = ['convert',
+                                '-o', outputFile.absolutePath,
+                                file.absolutePath,
+                                'docbook', 'dita']
+                    }
+                }
+            }
+        }
+    }
+
+    task('asciidoctorMarkdown', group: 'Documentation', description: "Renders markdown with pandoc from docbook files") { task ->
+        def docbookTask = project.tasks.getByName('asciidoctorDocbook')
+        dependsOn docbookTask
+        docbookTask.outputDirectories.each { inputs.dir it }
+        def outputDir = new File(project.buildDir, 'asciidoc/markdown')
+        outputs.dir outputDir
+        doLast {
+            inputs.files.each { file ->
+                if (file.name.endsWith('.xml')) {
+                    def relpath = shortestRelativePath(docbookTask.outputDirectories, file)
+                    def outputFile = new File(outputDir, (relpath - ~/\.xml$/) + ".md")
+                    outputFile.parentFile.mkdirs()
+                    exec {
+                        workingDir new File(project.buildDir, 'asciidoc/docbook')
+                        executable = "pandoc"
+                        args = ['-r', 'docbook',
+                                '-t', 'markdown',
+                                '-o', outputFile.absolutePath,
+                                file.absolutePath]
+                    }
+                }
+            }
+        }
+    }
+}
+
+task('createSlideTemplate') {
+    outputs.dir 'src/docs/slides'
+    doFirst {
+        def templateFile = file('src/docs/slides/template.adoc')
+        if (templateFile.exists()) {
+            throw new IllegalStateException(templateFile + " already exists.")
+        }
+        templateFile.text = '''
+            :presentation-title: Sample Presentation
+            :presentation-subtitle: Firstname Lastname
+            :presentation-date: {rendering-date}
+        
+            include::{themedir}/_firstslide.adoc[]
+        
+            == High level topic
+        
+            === Detailed slide
+        
+            * Bullet point
+            ** More, more
+        
+            [plantuml]
+            ----
+            A -> B
+            ----
+        
+            include::{themedir}/_lastslide.adoc[]
+        '''.stripIndent().trim()
+    }
+}
+
+if (project.file("src/docs/slides").exists()) {
+    apply plugin: de.undercouch.gradle.tasks.download.DownloadTaskPlugin
+
+    ext {
+        revealjsVersion = '3.7.0'
+        asciidoctorBackendVersion = '1.1.3'
+        downloadDir = new File(buildDir, 'revealjs-download')
+        templateDir = new File(downloadDir, 'templates')
+        revealJsDir = new File(downloadDir, 'reveal.js')
+        PresentationTheme = rootProject.file("gradle/presentation_theme.zip")
+        themeDir = new File(buildDir, 'slides-theme')
+        themeAsciidoc = new File(themeDir, 'asciidoc')
+        slidesOutputDir = new File(buildDir, 'slides')
+        slidesExportDir = new File(buildDir, 'slides-export')
+    }
+
+    task downloadRevealJsZip(type: Download) {
+        src "https://github.com/hakimel/reveal.js/archive/${revealjsVersion}.zip"
+        dest new File(downloadDir, "reveal.js-${revealjsVersion}.zip")
+        overwrite false
+    }
+
+    task downloadRevealJsUnzip(dependsOn: downloadRevealJsZip, type: Copy) {
+        from zipTree(downloadRevealJsZip.dest)
+        into revealJsDir
+    }
+
+    task downloadAsciidocRevealJsZip(type: Download) {
+        src "https://github.com/asciidoctor/asciidoctor-reveal.js/archive/v${asciidoctorBackendVersion}.zip"
+        dest new File(downloadDir, "asciidoctor-reveal.js-${asciidoctorBackendVersion}.zip")
+        overwrite false
+    }
+
+    task downloadAsciidocRevealJsUnzip(dependsOn: downloadAsciidocRevealJsZip, type: Copy) {
+        from zipTree(downloadAsciidocRevealJsZip.dest)
+        into templateDir
+    }
+
+    task downloadRevealJs {
+        dependsOn downloadRevealJsUnzip, downloadAsciidocRevealJsUnzip
+        description "Download extra deckjs/reveal.js resources"
+    }
+
+    task copyRevealJsTheme(type: Copy) {
+        dependsOn downloadRevealJs
+        destinationDir = slidesOutputDir
+
+        into("revealjs/reveal.js") {
+            from fileTree("$revealJsDir/reveal.js-${revealjsVersion}")
+        }
+        into("revealjs/reveal.js") {
+            from zipTree(PresentationTheme)
+        }
+        into("revealjs/reveal.js/css") {
+            from fileTree('src/docs/slides/css')
+        }
+    }
+
+    task extractThemeImagesAndAsciidocFiles(type: Copy) {
+        destinationDir themeDir
+        from zipTree(PresentationTheme)
+        include 'images/**', 'asciidoc/**'
+    }
+
+    task asciidoctorSlides(type: org.asciidoctor.gradle.AsciidoctorTask, group: 'Documentation', description: "Renders slides") {
+        dependsOn copyRevealJsTheme, extractThemeImagesAndAsciidocFiles
+
+        sourceDir = file('src/docs/slides')
+        outputDir = slidesOutputDir
+
+        resources {
+            from(sourceDir) {
+                include 'images/**'
+            }
+            from(themeDir) {
+                include 'images/**'
+            }
+        }
+
+        backends 'revealjs'
+        requires 'asciidoctor-diagram'
+
+        attributes 'endpoint-url': 'http://example.org',
+                'source-highlighter': 'highlightjs',
+                'imagesdir': './images',
+                'toc': 'left',
+                'icons': 'font',
+                'setanchors': 'true',
+                'idprefix': '',
+                'idseparator': '-',
+                'basedir': projectDir,
+                'docinfo1': '',
+                'project-version': '1.0',
+                'revealjs_transition': 'linear',
+                'revealjs_history': 'true',
+                'revealjs_slideNumber': 'true',
+                'revealjs_theme': 'test',
+                'revealjs_width': '1280',
+                'revealjs_height': '720',
+                'themedir': themeAsciidoc,
+                'background-image': 'eri_background_1280x720.svg',
+                'title-slide-background-image': 'eri_title_background_1280x720.svg',
+                'title-slide-transition': 'zoom',
+                'title-slide-transition-speed': 'fast',
+                'rendering-date': new Date().format('yyyy-MM-dd')
+        options template_dirs: [new File(templateDir, "asciidoctor-reveal.js-${asciidoctorBackendVersion}/templates").absolutePath]
+
+    }
+
+    /* PDF, JPEG & PNG export */
+    configurations {
+        pdf
+    }
+    repositories {
+        jcenter()
+    }
+    dependencies {
+        pdf 'me.champeau.deck2pdf:deck2pdf:0.3.0'
+    }
+
+    task exportSlides {}
+
+    ["pdf", "jpeg", "png"].each { type ->
+        def gentask = task "generate${type.capitalize()}Slides" {
+            inputs.files asciidoctorSlides
+            def outputDir = new File(slidesExportDir, "export")
+            outputs.dir outputDir
+            doLast {
+                def revealJsOutputDir = new File(slidesOutputDir, "revealjs")
+                fileTree(revealJsOutputDir) {
+                    include '*.html'
+                    exclude 'docinfo*.html'
+                }.each { file ->
+                    javaexec {
+                        workingDir = revealJsOutputDir
+                        main = 'me.champeau.deck2pdf.Main'
+                        args = [file.name, new File(outputDir, "${file.name - ~/\.html$/}.$type").absolutePath, '--profile=revealjs', '--width=1280', '--height=720']
+                        classpath = configurations.pdf
+                    }
+                }
+            }
+        }
+        exportSlides.dependsOn(gentask)
+    }
+
+    task('exportPdfSlides', group: 'Documentation', description: 'Renders slides to pdf with Chrome Headless') {
+        inputs.files asciidoctorSlides
+        def outputDir = new File(slidesExportDir, "print-pdf")
+        outputs.dir outputDir
+        doLast {
+            def revealJsOutputDir = new File(slidesOutputDir, "revealjs")
+            fileTree(revealJsOutputDir) {
+                include '*.html'
+                exclude 'docinfo*.html'
+            }.each { file ->
+                if (file.name.endsWith(".html")) {
+                    exec {
+                        workingDir = revealJsOutputDir
+                        executable = project.findProperty('chromePath') ?: 'google-chrome'
+                        args = ['--headless', "--print-to-pdf=${new File(outputDir, (file.name - ~/\.html$/) + '.pdf').absolutePath}", "${file.toURI()}?print-pdf"]
+                    }
+                }
+            }
+        }
+    }
+
+    task('exportDocxSlides', group: 'Documentation', description: "Renders slides to docx") { task ->
+        def docbookTask = project.tasks.getByName('asciidoctorSlides')
+        dependsOn docbookTask
+        docbookTask.outputDirectories.each { inputs.dir it }
+        def docxDir = new File(slidesExportDir, 'docx')
+        outputs.dir docxDir
+        doLast {
+            inputs.files.each { file ->
+                if (file.name.endsWith('.xml')) {
+                    def relpath = shortestRelativePath(docbookTask.outputDirectories, file)
+                    def outputFile = new File(outputDir, (relpath - ~/\.xml$/) + ".docx")
+                    outputFile.parentFile.mkdirs()
+                    exec {
+                        workingDir new File(slidesOutputDir, "docbook")
+                        executable = "pandoc"
+                        args = ['-r', 'docbook',
+                                '-t', 'docx',
+                                '-o', outputFile.absolutePath,
+                                file.absolutePath]
+                    }
+                }
+            }
+        }
+    }
+
+    gradle.taskGraph.whenReady { taskGraph ->
+        if (taskGraph.hasTask(exportDocxSlides)) {
+            project.tasks.getByName('asciidoctorSlides').with {
+                backends = ['docbook']
+                options.remove('template_dirs')
+            }
+        }
+    }
+}
